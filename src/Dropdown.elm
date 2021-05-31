@@ -1,7 +1,7 @@
 module Dropdown exposing
     ( State, init
     , Msg
-    , Config, basic, filterable, multi
+    , Config, basic, filterable, multi, customizable
     , withContainerAttributes, withPromptElement, withFilterPlaceholder, withSelectAttributes, withSearchAttributes, withOpenCloseButtons, withListAttributes
     , update, view
     , onOutsideClick
@@ -12,7 +12,7 @@ module Dropdown exposing
 
 @docs State, init
 @docs Msg
-@docs Config, basic, filterable, multi
+@docs Config, basic, filterable, multi, customizable
 @docs withContainerAttributes, withPromptElement, withFilterPlaceholder, withSelectAttributes, withSearchAttributes, withOpenCloseButtons, withListAttributes
 @docs update, view
 @docs onOutsideClick
@@ -35,12 +35,15 @@ type DropdownType
     = Basic
     | Filterable
     | MultiSelect
+    | Customizable
 
 
 type alias InternalState =
     { id : String
     , isOpen : Bool
     , filterText : String
+    , customText : Maybe String
+    , customTextSelected : Maybe String
     , focusedIndex : Int
     }
 
@@ -85,6 +88,7 @@ type alias InternalConfig item msg model =
     , promptElement : Element msg
     , itemToElement : Bool -> Bool -> item -> Element msg
     , itemToText : item -> String
+    , textToCustomItem : Maybe (String -> item)
     , filterPlaceholder : Maybe String
     , openButton : Element msg
     , closeButton : Element msg
@@ -120,6 +124,7 @@ type Msg item
     | OnClickPrompt
     | OnSelect item
     | OnFilterTyped String
+    | OnCustomTyped String
     | OnKeyDown Key
     | OnClickOutside
 
@@ -152,6 +157,8 @@ init id =
         { id = id
         , isOpen = False
         , filterText = ""
+        , customText = Nothing
+        , customTextSelected = Nothing
         , focusedIndex = 0
         }
 
@@ -186,6 +193,7 @@ basic { itemsFromModel, selectionFromModel, dropdownMsg, onSelectMsg, itemToProm
         , promptElement = el [ width fill ] (text "-- Select --")
         , itemToElement = itemToElement
         , itemToText = \_ -> ""
+        , textToCustomItem = Nothing
         , filterPlaceholder = Nothing
         , openButton = text "▼"
         , closeButton = text "▲"
@@ -226,6 +234,7 @@ multi { itemsFromModel, selectionFromModel, dropdownMsg, onSelectMsg, itemsToPro
         , promptElement = el [ width fill ] (text "-- Select --")
         , itemToElement = itemToElement
         , itemToText = \_ -> ""
+        , textToCustomItem = Nothing
         , filterPlaceholder = Nothing
         , openButton = text "▼"
         , closeButton = text "▲"
@@ -268,7 +277,53 @@ filterable { itemsFromModel, selectionFromModel, dropdownMsg, onSelectMsg, itemT
         , promptElement = el [ width fill ] (text "-- Select --")
         , itemToElement = itemToElement
         , itemToText = itemToText
+        , textToCustomItem = Nothing
         , filterPlaceholder = Just "Filter values"
+        , openButton = text "▼"
+        , closeButton = text "▲"
+        , containerAttributes = []
+        , listAttributes = []
+        , searchAttributes = []
+        , selectAttributes = []
+        }
+
+
+{-| Create a customizable configuration. This takes:
+
+    - itemsFromModel - The list of items to display in the dropdown (as a function of the model)
+    - selectionFromModel - The function to get the selected item from the model
+    - dropdownMsg - The message to wrap all the internal messages of the dropdown
+    - onSelectMsg - A message to trigger when an item is selected
+    - itemToPrompt - A function to get the Element to display from an item, to be used in the select part of the dropdown
+    - itemToElement - A function that takes a bool for whether the item is selected followed by a bool for whether the item is highlighted, followed by the item and returns the Element to display, to be used in the list part of the dropdown
+    - itemToText - A function to get the text representation from an item
+    - textToCustomItem - A function to get a custom item from typed text
+
+-}
+customizable :
+    { itemsFromModel : model -> List item
+    , selectionFromModel : model -> Maybe item
+    , dropdownMsg : Msg item -> msg
+    , onSelectMsg : Maybe item -> msg
+    , itemToPrompt : item -> Element msg
+    , itemToElement : Bool -> Bool -> item -> Element msg
+    , itemToText : item -> String
+    , textToCustomItem : String -> item
+    }
+    -> Config item msg model
+customizable { itemsFromModel, selectionFromModel, dropdownMsg, onSelectMsg, itemToPrompt, itemToElement, itemToText, textToCustomItem } =
+    Config
+        { dropdownType = Customizable
+        , itemsFromModel = itemsFromModel
+        , selectionFromModel = selectionFromModel >> SingleItem
+        , dropdownMsg = dropdownMsg
+        , onSelectMsg = OnSelectSingleItem onSelectMsg
+        , selectionToPrompt = SingleItemToPrompt itemToPrompt
+        , promptElement = el [ width fill ] (text "-- Select --")
+        , itemToElement = itemToElement
+        , itemToText = itemToText
+        , textToCustomItem = Just textToCustomItem
+        , filterPlaceholder = Just "Select or type..."
         , openButton = text "▼"
         , closeButton = text "▲"
         , containerAttributes = []
@@ -288,7 +343,7 @@ withPromptElement promptElement (Config config) =
     Config { config | promptElement = promptElement }
 
 
-{-| Sets the placeholder of the Filterable dropdown, default is "Filter values"
+{-| Sets the placeholder of the Filterable/Customizable dropdown, default is "Filter values"
 
     Dropdown.withFilterPlaceholder "Type here..." config
 
@@ -382,40 +437,70 @@ updateWithoutPerform (Config config) msg model ((State state) as untouchedState)
             ( untouchedState, [] )
 
         OnBlur ->
-            ( State { state | isOpen = closeOnlyIfNotMultiSelect config state }, [] )
+            case state.customText of
+                Nothing -> ( State { state | isOpen = closeOnlyIfNotMultiSelect config state }, [] )
+                Just t -> -- never multiselect
+                    case config.textToCustomItem of
+                        Nothing -> ( State { state | isOpen = False }, [] )
+                        Just ttci ->
+                            ( State { state | isOpen = False, customTextSelected = state.customText }
+                            , updateSelectedItemsCommand config.onSelectMsg [ ttci t ] )
 
         OnClickOutside ->
-            ( State { state | isOpen = False }, [] )
+            case state.customText of
+                Nothing -> ( State { state | isOpen = False }, [] )
+                Just t ->
+                    case config.textToCustomItem of
+                        Nothing -> ( State { state | isOpen = False }, [] )
+                        Just ttci ->
+                            ( State { state | isOpen = False, customTextSelected = state.customText }
+                            , updateSelectedItemsCommand config.onSelectMsg [ ttci t ] )
 
         OnClickPrompt ->
-            let
-                isOpen =
-                    not state.isOpen
+            if not state.isOpen then
+                ( State { state | isOpen = True, focusedIndex = 0, filterText = ""}
+                , [ DomFocus (OnDomFocus >> config.dropdownMsg) (state.id ++ "input-search") ] )
 
-                effect =
-                    if isOpen then
-                        [ DomFocus (OnDomFocus >> config.dropdownMsg) (state.id ++ "input-search") ]
-
-                    else
-                        []
-            in
-            ( State { state | isOpen = isOpen, focusedIndex = 0, filterText = "" }, effect )
+            else
+                case state.customText of
+                    Nothing ->
+                        ( State { state | isOpen = False, focusedIndex = 0, filterText = ""} , [] )
+                    Just t ->
+                        case config.textToCustomItem of
+                            Nothing ->
+                                ( State { state | isOpen = False, focusedIndex = 0, filterText = ""} , [] )
+                            Just ttci ->
+                                ( State { state | isOpen = False, focusedIndex = 0, filterText = "", customTextSelected = state.customText }
+                                , updateSelectedItemsCommand config.onSelectMsg [ ttci t ] )
+                                -- FIXME: this makes double-clicking to select the typed text impossible (annoying)
+                                -- FIXME: another issue is that the selection is hopelessly broken on iOS
 
         OnSelect item ->
             let
                 selectedItemsNew =
                     selectedItemsAsList config model
                         |> modifySelectedItems config.dropdownType item
+
+                customTextSelectedNew =
+                    if Just (config.itemToText item) == state.customTextSelected then
+                        state.customTextSelected
+                    else
+                        Nothing
             in
             ( State
                 { state
                     | isOpen = closeOnlyIfNotMultiSelect config state
+                    , customText = Nothing
+                    , customTextSelected = customTextSelectedNew
                 }
             , updateSelectedItemsCommand config.onSelectMsg selectedItemsNew
             )
 
         OnFilterTyped val ->
             ( State { state | filterText = val }, [] )
+
+        OnCustomTyped val ->
+            ( State { state | customText = if String.isEmpty val then Nothing else Just val }, [] )
 
         OnKeyDown key ->
             updateKeyDown config key model state
@@ -455,13 +540,24 @@ mapEffect applier effect =
             DomFocus (\result -> applier <| msg result) id
 
 
+customizedItemsFromModel : InternalConfig item msg model -> InternalState -> model -> List item
+customizedItemsFromModel config state model =
+    case state.customTextSelected of
+        Just t ->
+            case config.textToCustomItem of
+                Just ttci -> (ttci t) :: (config.itemsFromModel model)
+                Nothing -> config.itemsFromModel model
+        Nothing ->
+            config.itemsFromModel model
+
+
 {-| Update for the OnKeyDown message
 -}
 updateKeyDown : InternalConfig item msg model -> Key -> model -> InternalState -> ( State item, List (Effect msg) )
 updateKeyDown config key model state =
     let
         items =
-            config.itemsFromModel model
+            customizedItemsFromModel config state model
 
         clampIndex i =
             clamp 0 (List.length items - 1) i
@@ -478,19 +574,44 @@ updateKeyDown config key model state =
                 ( State { state | isOpen = True }, [] )
 
             else
-                ( State { state | isOpen = False }
-                , case findFocusedItem config.itemToText state.filterText state.focusedIndex items of
-                    Just focusedItem ->
-                        selectedItemsAsList config model
-                            |> modifySelectedItems config.dropdownType focusedItem
-                            |> updateSelectedItemsCommand config.onSelectMsg
+                let
+                    upd =
+                        ( State { state | isOpen = False }
+                        , case findFocusedItem config.itemToText state.filterText state.focusedIndex items of
+                            Just focusedItem ->
+                                selectedItemsAsList config model
+                                    |> modifySelectedItems config.dropdownType focusedItem
+                                    |> updateSelectedItemsCommand config.onSelectMsg
 
+                            Nothing ->
+                                []
+                        )
+                in
+                case state.customText of
                     Nothing ->
-                        []
-                )
+                        case state.customTextSelected of
+                            Nothing -> upd
+                            Just cts ->
+                                case findFocusedItem config.itemToText state.filterText state.focusedIndex items of
+                                    Just focusedItem ->
+                                        case config.textToCustomItem of
+                                            Nothing -> upd -- shouldn't happen (just like any other Nothing in this case)
+                                            Just ttci ->
+                                                if focusedItem == (ttci cts) then
+                                                    ( State { state | isOpen = False, customTextSelected = Nothing, customText = Nothing }
+                                                    , updateSelectedItemsCommand config.onSelectMsg [] )
+                                                else
+                                                    upd
+                                    Nothing -> upd
+                    Just t ->
+                        case config.textToCustomItem of
+                            Nothing -> upd
+                            Just ttci ->
+                                ( State { state | isOpen = False, customTextSelected = state.customText }
+                                , updateSelectedItemsCommand config.onSelectMsg [ ttci t ] )
 
         Esc ->
-            ( State { state | isOpen = False }, [] )
+            ( State { state | isOpen = False, customText = state.customTextSelected }, [] )
 
 
 
@@ -587,7 +708,7 @@ view : Config item msg model -> model -> State item -> Element msg
 view (Config config) model (State state) =
     let
         items =
-            config.itemsFromModel model
+            customizedItemsFromModel config state model
 
         selectedItems =
             selectedItemsAsList config model
@@ -680,6 +801,21 @@ triggerView config selectedItems state =
                             config.filterPlaceholder
                                 |> Maybe.map (text >> Input.placeholder [])
                         , label = Input.labelHidden "Filter List"
+                        }
+
+                Customizable ->
+                    Input.search
+                        (idAttr (state.id ++ "input-search")
+                            :: focused []
+                            :: onBlurAttribute config state
+                            :: config.searchAttributes
+                        )
+                        { onChange = config.dropdownMsg << OnCustomTyped
+                        , text = Maybe.withDefault "" state.customText
+                        , placeholder =
+                            config.filterPlaceholder
+                                |> Maybe.map (text >> Input.placeholder [])
+                        , label = Input.labelHidden "Customize List"
                         }
 
         ( promptOrSearch, button ) =
